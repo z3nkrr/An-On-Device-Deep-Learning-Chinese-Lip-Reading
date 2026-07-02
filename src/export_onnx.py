@@ -1,105 +1,89 @@
 """
-Export a trained FullModel checkpoint to ONNX.
+export_onnx.py — 將訓練好的 FullModel checkpoint 匯出成 ONNX
+（對應 SE-Res + Bi-GRU + MS-TCN 架構版本的 model.py）
 
-Usage (PowerShell):
-python d:\Project\src\export_onnx.py --ckpt d:\Project\checkpoints\epoch_50.pt --out d:\Project\checkpoints\model_epoch50.onnx --seq-len 40 --spatial-size 88
+用法（PowerShell）:
+python export_onnx.py --ckpt checkpoints\best.pt --out checkpoints\model.onnx --seq-len 40 --spatial-size 88
 
-Notes:
-- The script loads the checkpoint (accepts dict with 'state_dict' or a raw state_dict).
-- It attempts to infer num_classes from the checkpoint (backend.fc.weight shape).
-- Exports two outputs: 'logits' (B, num_classes) and 'logits_t' (B, T', num_classes).
-- Uses dynamic axes for batch and time dimensions so the ONNX can accept variable batch/time sizes.
+說明：
+- 自動從 checkpoint 推斷 num_classes（讀取 classifier.1.weight 的 shape）
+- 匯出兩個輸出: 'logits' (B, num_classes) 與 'seq' (B, T', 256)
+- 使用 dynamic_axes，讓匯出的 ONNX 可接受不同的 batch / time 長度
 """
+
 import os
+import sys
 import argparse
 import torch
-import sys
 
-# ensure project root for importing src.model
-SCRIPT_DIR = os.path.dirname(__file__)
-PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '..'))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
-from src.model import FullModel
+from model import FullModel
 
 
 def infer_num_classes_from_ckpt(ckpt):
-    # ckpt may be a dict with 'state_dict' or a raw state_dict
     sd = ckpt.get('state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
-    # find backend.fc.weight key
+    # FullModel 的分類層是 classifier.1.weight (nn.Sequential: Dropout, Linear)
     for k, v in sd.items():
-        if k.endswith('backend.fc.weight') or k.endswith('backend.fc.weight'.replace('.', '_')):
+        if k.endswith('classifier.1.weight'):
             return v.shape[0]
-    # fallback: search for 'fc.weight'
+    # 後備：找任何以 fc.weight 或 classifier 結尾的權重
     for k, v in sd.items():
-        if k.endswith('fc.weight'):
+        if 'classifier' in k and k.endswith('.weight') and v.dim() == 2:
             return v.shape[0]
-    raise RuntimeError('Could not infer num_classes from checkpoint state_dict')
+    raise RuntimeError('無法從 checkpoint 推斷 num_classes，請確認權重鍵名')
 
 
 def load_state_dict_into_model(model, ckpt):
     sd = ckpt.get('state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
-    # allow keys prefixed with 'module.' from DataParallel
     new_sd = {}
     for k, v in sd.items():
-        nk = k
-        if k.startswith('module.'):
-            nk = k[len('module.'):]
+        nk = k[len('module.'):] if k.startswith('module.') else k
         new_sd[nk] = v
     model.load_state_dict(new_sd)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ckpt', required=True, help='Path to checkpoint (.pt) to load')
-    parser.add_argument('--out', required=True, help='Output ONNX path')
-    parser.add_argument('--seq-len', type=int, default=40, help='Temporal length for dummy input')
-    parser.add_argument('--spatial-size', type=int, default=88, help='Spatial H/W for dummy input')
-    parser.add_argument('--in-channels', type=int, default=1, help='Input channels (default 1)')
-    parser.add_argument('--opset', type=int, default=12, help='ONNX opset version')
+    parser.add_argument('--ckpt', required=True, help='訓練好的權重路徑 (.pt)')
+    parser.add_argument('--out',  required=True, help='輸出 ONNX 路徑')
+    parser.add_argument('--seq-len',      type=int, default=40, help='time 長度（dummy input）')
+    parser.add_argument('--spatial-size', type=int, default=88, help='影像 H/W（dummy input）')
+    parser.add_argument('--in-channels',  type=int, default=1,  help='輸入 channel 數')
+    parser.add_argument('--opset',        type=int, default=13, help='ONNX opset 版本')
     args = parser.parse_args()
 
     if not os.path.isfile(args.ckpt):
-        print('Checkpoint not found:', args.ckpt)
+        print(f'[✗] 找不到 checkpoint: {args.ckpt}')
         return
 
     ckpt = torch.load(args.ckpt, map_location='cpu')
-    try:
-        num_classes = infer_num_classes_from_ckpt(ckpt)
-    except Exception as e:
-        print('Failed to infer num_classes from checkpoint:', e)
-        print('Please re-run with --num-classes (not implemented).')
-        raise
+    num_classes = infer_num_classes_from_ckpt(ckpt)
+    print(f'[✓] 推斷 num_classes = {num_classes}')
 
-    print(f'Inferred num_classes={num_classes} from checkpoint')
-
-    model = FullModel(num_classes=num_classes, in_channels=args.in_channels, frontend_out=64, pretrained_resnet=False, dropout=0.0)
+    # 對應 SE-Res + Bi-GRU + MS-TCN 版本的 FullModel
+    model = FullModel(num_classes=num_classes,
+                      in_channels=args.in_channels,
+                      dropout=0.0)  # 匯出時關掉 dropout
     load_state_dict_into_model(model, ckpt)
     model.eval()
     model.to('cpu')
 
     # dummy input: (B, T, C, H, W)
-    B = 1
-    T = args.seq_len
-    C = args.in_channels
-    H = args.spatial_size
-    W = args.spatial_size
-    dummy = torch.zeros((B, T, C, H, W), dtype=torch.float)
+    dummy = torch.zeros((1, args.seq_len, args.in_channels,
+                         args.spatial_size, args.spatial_size), dtype=torch.float)
 
-    # export
     output_path = args.out
-    output_dir = os.path.dirname(output_path)
+    output_dir  = os.path.dirname(output_path)
     if output_dir and not os.path.isdir(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    input_names = ['input']
-    output_names = ['logits', 'logits_t']
-    dynamic_axes = {
-        'input': {0: 'batch', 1: 'time'},
-        'logits': {0: 'batch'},
-        'logits_t': {0: 'batch', 1: 'time_out'}
-    }
+    input_names  = ['input']
+    output_names = ['logits', 'seq']
+    # 靜態 shape 匯出：不傳 dynamic_axes，batch/time 完全固定為 dummy input 的大小
+    # 這樣 onnx2tf 轉 TFLite 時不需要處理動態維度，速度快很多也更穩定
 
     with torch.no_grad():
         try:
@@ -112,11 +96,17 @@ def main():
                 do_constant_folding=True,
                 input_names=input_names,
                 output_names=output_names,
-                dynamic_axes=dynamic_axes,
+                dynamo=False,
             )
-            print('Exported ONNX to', output_path)
+            print(f'[✓] ONNX 匯出成功: {output_path}')
+
+            # 簡單驗證輸出 shape
+            logits, seq = model(dummy)
+            print(f'    logits shape : {tuple(logits.shape)}')
+            print(f'    seq shape    : {tuple(seq.shape)}')
+
         except Exception as e:
-            print('ONNX export failed:', repr(e))
+            print(f'[✗] ONNX 匯出失敗: {repr(e)}')
             raise
 
 

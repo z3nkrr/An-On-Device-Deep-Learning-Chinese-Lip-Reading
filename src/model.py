@@ -1,165 +1,244 @@
+"""
+model.py — 唇語辨識模型
+架構：Front-end (3D Conv + SE-ResNet18) + Back-end (Bi-GRU + MS-TCN)
+輸入：(B, T, C, H, W)  — dataset stack 後的格式
+輸出：(B, num_classes), (B, T, 256)
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import models
 
 
+# ============================================================
+# 1.  SE-Res Block
+# ============================================================
 class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=16):
-        super(SEBlock, self).__init__()
-        self.fc1 = nn.Linear(channels, channels // reduction)
-        self.fc2 = nn.Linear(channels // reduction, channels)
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(channels, mid)
+        self.fc2 = nn.Linear(mid, channels)
 
-    def forward(self, x):
-        # x: (N, C, H, W) or (N, C)
-        if x.dim() == 4:
-            z = x.mean(dim=(2, 3))  # (N, C)
-        elif x.dim() == 2:
-            z = x
-        else:
-            # fallback: global mean on last dim
-            z = x.mean(dim=1)
-        z = self.fc1(z)
-        z = F.relu(z)
-        z = self.fc2(z)
-        z = torch.sigmoid(z)
-        if x.dim() == 4:
-            z = z.unsqueeze(-1).unsqueeze(-1)
-        return x * z
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.gap(x).flatten(1)
+        w = F.relu(self.fc1(w))
+        w = torch.sigmoid(self.fc2(w))
+        return x * w.view(w.size(0), w.size(1), 1, 1)
 
 
-class Frontend3D(nn.Module):
-    def __init__(self, in_channels=1, out_channels=64):
-        super(Frontend3D, self).__init__()
-        # 3D conv kernel 5x7x7
-        self.conv3d = nn.Conv3d(in_channels, out_channels, kernel_size=(5, 7, 7), padding=(2, 3, 3), bias=False)
-        self.bn = nn.BatchNorm3d(out_channels)
+class SEResBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1, reduction: int = 16):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(out_ch)
+        self.se    = SEBlock(out_ch, reduction)
+        self.downsample = (
+            nn.Sequential(nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
+                          nn.BatchNorm2d(out_ch))
+            if stride != 1 or in_ch != out_ch else None
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        if self.downsample is not None:
+            residual = self.downsample(x)
+        return F.relu(out + residual)
+
+
+def make_se_res_layer(in_ch, out_ch, blocks=2, stride=1):
+    layers = [SEResBlock(in_ch, out_ch, stride=stride)]
+    for _ in range(1, blocks):
+        layers.append(SEResBlock(out_ch, out_ch))
+    return nn.Sequential(*layers)
+
+
+# ============================================================
+# 2.  Front-end：3D Conv stem + SE-ResNet18
+# ============================================================
+class FrontEnd(nn.Module):
+    """
+    輸入：(B, T, C, H, W)
+    輸出：(B, T, 512)
+    """
+    def __init__(self, in_channels: int = 1):
+        super().__init__()
+        # 3D Conv（時序+空間卷積，TFLite 原生支援 Conv3D）
+        self.conv3d = nn.Conv3d(in_channels, 64,
+                                kernel_size=(5, 7, 7),
+                                stride=(1, 2, 2),
+                                padding=(2, 3, 3),
+                                bias=False)
+        self.bn   = nn.BatchNorm3d(64)
         self.relu = nn.ReLU(inplace=True)
-        # max-pooling with temporal=1, spatial=3x3 (stride spatial 2)
-        self.pool = nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
+        # 注意：原本用 nn.MaxPool3d(kernel=(1,3,3)) 只對空間維度做池化，
+        # 時間維度 kernel=1/stride=1 完全不動，數學上等價於逐幀 MaxPool2d。
+        # 改寫成 Reshape + MaxPool2d 是因為 MaxPool3D 在 ONNX→TFLite 轉換時
+        # 會被 onnx2tf 標記為 Flex op（需要 TensorFlow Select Ops 才能跑），
+        # 在手機/嵌入式裝置上不可用。拆成標準 2D MaxPool 可避免這個問題，
+        # 不影響任何可學習參數，可直接沿用舊權重。
+        self.pool_kernel  = 3
+        self.pool_stride  = 2
+        self.pool_padding = 1
 
-    def forward(self, x):
-        # x: (B, T, C, H, W) -> Conv3d expects (B, C, T, H, W)
-        x = x.permute(0, 2, 1, 3, 4)
+        # SE-Res1~4：64 → 64 → 128 → 256 → 512
+        self.layer1 = make_se_res_layer(64,  64,  blocks=2, stride=1)
+        self.layer2 = make_se_res_layer(64,  128, blocks=2, stride=2)
+        self.layer3 = make_se_res_layer(128, 256, blocks=2, stride=2)
+        self.layer4 = make_se_res_layer(256, 512, blocks=2, stride=2)
+        self.gap    = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C, H, W) → Conv3d 需要 (B, C, T, H, W)
+        x = x.permute(0, 2, 1, 3, 4).contiguous()  # (B, C, T, H, W)
         x = self.conv3d(x)
         x = self.bn(x)
-        x = self.relu(x)
-        x = self.pool(x)
-        # output (B, C', T', H', W') -> convert back to (B, T', C', H', W')
-        x = x.permute(0, 2, 1, 3, 4)
+        x = self.relu(x)                            # (B, 64, T, H, W)
+
+        # 逐幀 2D MaxPool（取代 MaxPool3d，TFLite 友善）
+        B, C, T, H, W = x.shape
+        x = x.permute(0, 2, 1, 3, 4).contiguous()  # (B, T, 64, H, W)
+        x = x.view(B * T, C, H, W)                 # (B*T, 64, H, W)
+        x = F.max_pool2d(x, kernel_size=self.pool_kernel,
+                         stride=self.pool_stride,
+                         padding=self.pool_padding)  # (B*T, 64, H', W')
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.gap(x).flatten(1)                  # (B*T, 512)
+        x = x.view(B, T, -1)                        # (B, T, 512)
         return x
 
 
-class SE_ResNet18_FrameEncoder(nn.Module):
-    def __init__(self, in_channels=64, pretrained=False, dropout=0.5):
-        super(SE_ResNet18_FrameEncoder, self).__init__()
-        # load torchvision resnet18 using the new 'weights' API when available
-        try:
-            # torchvision >= 0.13
-            from torchvision.models import ResNet18_Weights
-            weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-            resnet = models.resnet18(weights=weights)
-        except Exception:
-            # fallback for older torchvision versions that use pretrained flag
-            resnet = models.resnet18(pretrained=pretrained)
-        # adapt first conv to accept in_channels
-        resnet.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.backbone = resnet
-        self.feat_dim = 512
-        # SE blocks for each ResNet layer output (channel sizes: 64,128,256,512)
-        self.se1 = SEBlock(64)
-        self.se2 = SEBlock(128)
-        self.se3 = SEBlock(256)
-        self.se4 = SEBlock(512)
-        self.dropout = nn.Dropout(p=dropout)
+# ============================================================
+# 3.  Back-end：Bi-GRU + MS-TCN
+# ============================================================
+class TemporalConvBlock(nn.Module):
+    """dilated causal Conv1d + residual"""
+    def __init__(self, in_ch: int, out_ch: int,
+                 kernel_size: int = 3, dilation: int = 1, dropout: float = 0.2):
+        super().__init__()
+        pad = (kernel_size - 1) * dilation
+        self.net = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size, padding=pad, dilation=dilation),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Conv1d(out_ch, out_ch, 1),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.shortcut = (nn.Conv1d(in_ch, out_ch, 1)
+                         if in_ch != out_ch else nn.Identity())
 
-    def forward(self, frames):
-        # frames: (B, T, C, H, W)
-        B, T, C, H, W = frames.shape
-        # ensure contiguous before reshaping (fixes view() error when tensor is not contiguous)
-        x = frames.contiguous().view(B * T, C, H, W)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.net(x)[..., :x.size(-1)]         # 截掉 causal padding 多餘部分
+        return F.relu(out + self.shortcut(x))
 
-        x = self.backbone.conv1(x)
-        x = self.backbone.bn1(x)
-        x = self.backbone.relu(x)
-        x = self.backbone.maxpool(x)
 
-        x = self.backbone.layer1(x)
-        x = self.se1(x)
-        x = self.backbone.layer2(x)
-        x = self.se2(x)
-        x = self.backbone.layer3(x)
-        x = self.se3(x)
-        x = self.backbone.layer4(x)
-        x = self.se4(x)
+class MSTCN(nn.Module):
+    """
+    TCN-1: 1024 → 512  (dilation=1)
+    TCN-2:  512 → 512  (dilation=2)
+    TCN-3:  512 → 256  (dilation=4)
+    """
+    def __init__(self, in_ch: int = 1024, dropout: float = 0.2):
+        super().__init__()
+        self.tcn1 = TemporalConvBlock(in_ch, 512, dilation=1, dropout=dropout)
+        self.tcn2 = TemporalConvBlock(512,   512, dilation=2, dropout=dropout)
+        self.tcn3 = TemporalConvBlock(512,   256, dilation=4, dropout=dropout)
 
-        x = self.backbone.avgpool(x)
-        x = torch.flatten(x, 1)  # (B*T, 512)
-        # apply dropout per-frame
-        x = self.dropout(x)
-        x = x.view(B, T, -1)  # (B, T, feat_dim)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.tcn1(x)
+        x = self.tcn2(x)
+        x = self.tcn3(x)
+        return x                                    # (B, 256, T)
+
+
+class BackEnd(nn.Module):
+    """
+    輸入：(B, T, 512)
+    輸出：(B, T, 256)
+    """
+    def __init__(self, input_size: int = 512, hidden_size: int = 512,
+                 dropout: float = 0.3):
+        super().__init__()
+        # Bi-GRU: 512 → 1024
+        self.bigru = nn.GRU(input_size, hidden_size,
+                            num_layers=1,
+                            batch_first=True,
+                            bidirectional=True)
+        self.gru_drop = nn.Dropout(dropout)
+        # MS-TCN: 1024 → 512 → 512 → 256
+        self.mstcn = MSTCN(in_ch=hidden_size * 2, dropout=dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, _ = self.bigru(x)                        # (B, T, 1024)
+        x = self.gru_drop(x)
+        x = x.permute(0, 2, 1)                     # (B, 1024, T)
+        x = self.mstcn(x)                           # (B, 256, T)
+        x = x.permute(0, 2, 1)                     # (B, T, 256)
         return x
 
 
-class BGCLBackEnd(nn.Module):
-    def __init__(self, input_dim, num_classes, gru_hidden=1024, gru_layers=3, conv_channels=(1024, 512, 512, 256), conv_kernels=(32, 32, 16, 16), dropout=0.5):
-        super(BGCLBackEnd, self).__init__()
-        # Bi-GRU: bidirectional GRU with multiple layers
-        self.gru = nn.GRU(input_dim, gru_hidden, num_layers=gru_layers, batch_first=True, bidirectional=True)
-        self.post_conv = nn.ModuleList()
-        in_ch = gru_hidden * 2
-        for out_ch, k in zip(conv_channels, conv_kernels):
-            self.post_conv.append(nn.Sequential(
-                nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k//2, bias=False),
-                nn.BatchNorm1d(out_ch),
-                nn.ReLU(inplace=True)
-            ))
-            in_ch = out_ch
-        self.dropout = nn.Dropout(p=dropout)
-        # fully connected maps per timestep features to class logits
-        self.fc = nn.Linear(in_ch, num_classes)
-
-    def forward(self, x, lengths=None):
-        # x: (B, T, D)
-        if lengths is not None:
-            packed = nn.utils.rnn.pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-            packed_out, _ = self.gru(packed)
-            out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
-        else:
-            out, _ = self.gru(x)
-        # out: (B, T, 2*gru_hidden)
-        out = out.permute(0, 2, 1)  # (B, C, T)
-        for layer in self.post_conv:
-            out = layer(out)
-        # out: (B, C, T)
-        out = out.permute(0, 2, 1)  # (B, T, C)
-        out = self.dropout(out)
-        logits_t = self.fc(out)  # (B, T, num_classes)
-        return logits_t
-
-
+# ============================================================
+# 4.  FullModel
+# ============================================================
 class FullModel(nn.Module):
-    def __init__(self, num_classes, in_channels=1, frontend_out=64, pretrained_resnet=False, dropout=0.5):
-        super(FullModel, self).__init__()
-        self.frontend = Frontend3D(in_channels=in_channels, out_channels=frontend_out)
-        self.encoder = SE_ResNet18_FrameEncoder(in_channels=frontend_out, pretrained=pretrained_resnet, dropout=dropout)
-        self.backend = BGCLBackEnd(input_dim=self.encoder.feat_dim, num_classes=num_classes, dropout=dropout)
+    """
+    Args:
+        num_classes: 輸出類別數（163）
+        in_channels: 輸入影像 channel（灰階=1）
+        dropout:     Dropout 比例
 
-    def forward(self, x, lengths=None):
-        # x: (B, T, C, H, W)
+    Returns:
+        logits:   (B, num_classes)  — 用於 CrossEntropyLoss
+        features: (B, T, 256)       — 序列特徵（備用）
+    """
+    def __init__(self, num_classes: int = 187,
+                 in_channels: int = 1,
+                 dropout: float = 0.3):
+        super().__init__()
+        self.frontend   = FrontEnd(in_channels=in_channels)
+        self.backend    = BackEnd(input_size=512, hidden_size=512, dropout=dropout)
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: (B, T, C, H, W)  — DataLoader stack 後的格式
+        """
         x = x.float()
-        x = self.frontend(x)  # (B, T', C', H', W')
-        features = self.encoder(x)  # (B, T', feat_dim)
-        logits_t = self.backend(features, lengths=lengths)  # (B, T', num_classes)
-        # temporal GAP (masked)
-        if lengths is None:
-            logits = logits_t.mean(dim=1)
-        else:
-            B, T, C = logits_t.shape
-            device = logits_t.device
-            mask = torch.arange(T, device=device).unsqueeze(0) < lengths.unsqueeze(1)
-            mask = mask.float().unsqueeze(-1)
-            summed = (logits_t * mask).sum(dim=1)
-            denom = lengths.to(device).unsqueeze(1).clamp(min=1).float()
-            logits = summed / denom
-        return logits, logits_t
+        feat = self.frontend(x)                     # (B, T, 512)
+        seq  = self.backend(feat)                   # (B, T, 256)
+        logits = self.classifier(seq.mean(dim=1))   # (B, num_classes)
+        return logits, seq
+
+
+# ============================================================
+# 5.  快速測試
+# ============================================================
+if __name__ == '__main__':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model  = FullModel(num_classes=187, in_channels=1).to(device)
+
+    # dataset 輸出格式：(B, T, C, H, W)
+    dummy = torch.randn(2, 40, 1, 88, 88).to(device)
+    logits, seq = model(dummy)
+
+    print(f"logits : {logits.shape}")    # → (2, 163)
+    print(f"seq    : {seq.shape}")       # → (2, 40, 256)
+
+    total = sum(p.numel() for p in model.parameters())
+    print(f"params : {total:,}")

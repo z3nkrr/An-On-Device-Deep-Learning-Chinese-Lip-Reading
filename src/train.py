@@ -5,9 +5,13 @@ import argparse
 import time
 import csv
 import numpy as np
-import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch
+try:
+    import intel_extension_for_pytorch as ipex
+except ImportError:
+    pass
 
 # --- 1. 自動定位當前目錄 ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -114,14 +118,19 @@ def validate(model, loader, criterion, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', required=True)
-    parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--epochs', type=int, default=150)
-    parser.add_argument('--lr', type=float, default=5e-4) 
+    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--lr', type=float, default=3e-4) 
     parser.add_argument('--save-dir', default='./checkpoints')
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        device = torch.device('xpu')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
     csv_path = os.path.join(args.save_dir, 'result.csv')
 
     # 載入標籤
@@ -147,13 +156,13 @@ def main():
     model = FullModel(num_classes=num_classes, in_channels=1).to(device)
     
     # --- 2. 強化 L2 正則化 (Weight Decay) ---
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     
     # --- 3. 損失函數 (標籤平滑) ---
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1) 
     
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    early_stopping = EarlyStopping(patience=25)
+    early_stopping = EarlyStopping(patience=20)
 
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
