@@ -1,13 +1,50 @@
 # An On-Device Deep-Learning Chinese Lip-Reading Input Method for Accessible Mobile Text Entry
+
+Reference implementation accompanying the manuscript submitted to
+*IEEE Consumer Electronics Magazine*.
+
 ## Content
 
-- [Introduction](#Introduction)
-- [Usage](#Usage)
-
+- [Introduction](#introduction)
+- [Scope and Limitations](#scope-and-limitations)
+- [Usage](#usage)
 
 ## Introduction
 
-In this repository, we provide an end-to-end deep lip-reading pipeline as well as training configurations and TFLite edge-deployment utilities. We evaluate our pipeline on the DMCLR Dataset. We obtain **87.83%** accuracy on the held-out Mandarin dataset split. The results demonstrate that our proposed mobile-friendly architecture is highly feasible for consumer hardware deployment. **Especially, we achieve an on-device inference latency of ~180 ms per word segment on a commodity smartphone, validating that local, privacy-preserving lip-reading is fully practical for real-world text entry.**
+This repository provides an end-to-end Chinese lip-reading pipeline, training
+configurations, and TFLite utilities for edge deployment, together with the
+Android application that performs inference, pinyin-dictionary decoding, and
+cross-application text injection entirely on the device.
+
+The model is trained and evaluated on the DMCLR dataset. On a held-out split of
+DMCLR it reaches **87.83%** word-level accuracy. On a Samsung Galaxy S25 the
+exported TFLite model requires approximately **180 ms of model inference per
+word segment**. This figure covers model inference only; it excludes camera
+capture, frame extraction, landmark detection, mouth cropping, dictionary
+decoding, and text injection.
+
+## Scope and Limitations
+
+This repository demonstrates that the complete pipeline — on-device inference,
+dictionary decoding, and cross-application text entry — can be integrated and
+executed within the resource budget of a consumer smartphone. It does **not**
+demonstrate a usable everyday input method.
+
+- The reported accuracy is measured on a held-out split of DMCLR, which was
+  recorded under controlled conditions. It does not transfer to live phone
+  capture.
+- In informal testing with the phone camera, recognition failed even for
+  utterances drawn from the training vocabulary. The gap between the dataset's
+  recording conditions and live capture is severe rather than marginal, and
+  closing it remains open work.
+- Word segmentation is semi-automatic: the user taps a button during recording
+  to mark word boundaries. The system is therefore not hands-free in its
+  current form.
+- The latency figure above is model inference only and should not be read as
+  end-to-end response time.
+
+We state these limitations explicitly so that this artifact is not mistaken for
+a deployable product.
 
 ## Usage
 
