@@ -8,6 +8,8 @@ Reference implementation accompanying the manuscript submitted to
 - [Introduction](#introduction)
 - [Scope and Limitations](#scope-and-limitations)
 - [Usage](#usage)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
 
 ## Introduction
 
@@ -49,38 +51,65 @@ a deployable product.
 ## Usage
 
 1.Model training:
+
 ```
-python train.py --data "path/to/DMCLR_Dataset" 
-                --batch-size 8 
-                --epochs 100 
-                --lr 3e-4 
+python train.py --data "path/to/DMCLR_Dataset"
+                --batch-size 8
+                --epochs 100
+                --lr 3e-4
                 --save-dir ./checkpoints
 ```
+
 Key arguments:
-- `data`: Path to the dataset root folder containing train and test splits.  
-- `batch-size`: Set to 8 by default.  
-- `epochs`: Training limit set to 100 epochs with Cosine Annealing learning rate scheduling and early stopping.  
+
+- `data`: Path to the dataset root folder containing train and test splits.
+- `batch-size`: Set to 8 by default.
+- `epochs`: Training limit set to 100 epochs with Cosine Annealing learning rate scheduling and early stopping.
 - `lr`: Base learning rate initialized at 3e-4.
 
 Outputs:
+
 - `checkpoints/latest.pt`: State dictionary of the most recent epoch.
 - `checkpoints/best.pt`: State dictionary capturing the top validation accuracy.
 - `checkpoints/result.csv`: CSV log storing epoch number, training metrics, validation loss, validation accuracy, and learning rates
 
 2.Model Export & Deployment:
 Export PyTorch to ONNX:
+
 ```
-python export_onnx.py --ckpt checkpoints/best.pt 
-                      --out checkpoints/model.onnx 
-                      --seq-len 40 
-                      --spatial-size 88 
-                      --in-channels 1 
+python export_onnx.py --ckpt checkpoints/best.pt
+                      --out checkpoints/model.onnx
+                      --seq-len 40
+                      --spatial-size 88
+                      --in-channels 1
                       --opset 13
 ```
+
 Export ONNX to TFLite:
+
 ```
-python export_tflite.py --ckpt checkpoints/best.pt 
-                        --out checkpoints/model.tflite 
-                        --seq-len 40 
+python export_tflite.py --ckpt checkpoints/best.pt
+                        --out checkpoints/model.tflite
+                        --seq-len 40
                         --spatial-size 88
 ```
+
+## Acknowledgements
+
+The floating-window user interface is built on
+[compose-floating-window](https://github.com/only52607/compose-floating-window)
+by only52607, used as an unmodified dependency under the Apache License 2.0.
+
+Facial landmark detection uses MediaPipe, and on-device inference uses
+TensorFlow Lite, both by Google under the Apache License 2.0.
+
+See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list of
+third-party components and their licenses.
+
+## License
+
+The code in this repository is released under the MIT License.
+See [LICENSE](LICENSE) for details.
+
+Third-party dependencies remain under their own licenses; see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
