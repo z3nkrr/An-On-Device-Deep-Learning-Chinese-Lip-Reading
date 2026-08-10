@@ -51,6 +51,14 @@ class LipReadingManager(private val context: Context) {
                 setNumThreads(4)
             }
             tfliteInterpreter = Interpreter(mappedByteBuffer, options)
+
+            tfliteInterpreter?.let { itp ->
+                val inT = itp.getInputTensor(0)
+                val outT = itp.getOutputTensor(0)
+                Log.d("LRI_DEBUG", "INPUT  shape = [${inT.shape().joinToString()}]  dtype = ${inT.dataType()}")
+                Log.d("LRI_DEBUG", "OUTPUT shape = [${outT.shape().joinToString()}]  dtype = ${outT.dataType()}")
+            }
+
             isModelReady = true
             Log.d("LRI_DEBUG", "✅ TFLite 模型載入成功 (背景)")
             benchmarkInference()
@@ -162,6 +170,7 @@ class LipReadingManager(private val context: Context) {
         val sorted = times.sortedArray()
         val median = sorted[iters / 2]
         val p95 = sorted[(iters * 95 / 100).coerceAtMost(iters - 1)]
+
 
         Log.i("LRI_BENCH", "=== 純模型推論延遲 (n=$iters, threads=4) ===")
         Log.i("LRI_BENCH", "Mean=%.2f ms  Std=%.2f ms".format(mean, std))

@@ -449,16 +449,41 @@ class FloatingWindowService : LifecycleService() {
         return null
     }
 
+//    private fun toGrayscaleAndResize(bmp: Bitmap, targetWidth: Int, targetHeight: Int): Bitmap {
+//        val scaledBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+//        val canvas = Canvas(scaledBitmap)
+//        val paint = Paint()
+//        val colorMatrix = ColorMatrix()
+//        colorMatrix.setSaturation(0f)
+//        val filter = ColorMatrixColorFilter(colorMatrix)
+//        paint.colorFilter = filter
+//        canvas.drawBitmap(bmp, null, Rect(0, 0, targetWidth, targetHeight), paint)
+//        return scaledBitmap
+//    }
     private fun toGrayscaleAndResize(bmp: Bitmap, targetWidth: Int, targetHeight: Int): Bitmap {
-        val scaledBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(scaledBitmap)
-        val paint = Paint()
-        val colorMatrix = ColorMatrix()
-        colorMatrix.setSaturation(0f)
-        val filter = ColorMatrixColorFilter(colorMatrix)
-        paint.colorFilter = filter
-        canvas.drawBitmap(bmp, null, Rect(0, 0, targetWidth, targetHeight), paint)
-        return scaledBitmap
+        val enlarge = (targetWidth * 1.1).toInt()      // 96，對齊 dataset.py 的 enlarge_size
+        val offset = (enlarge - targetWidth) / 2       // 4
+
+        // 用 PIL 'L' 的亮度係數 (BT.601)，而非 setSaturation(0f) 的 BT.709
+        val lum = floatArrayOf(
+            0.299f, 0.587f, 0.114f, 0f, 0f,
+            0.299f, 0.587f, 0.114f, 0f, 0f,
+            0.299f, 0.587f, 0.114f, 0f, 0f,
+            0f,     0f,     0f,     1f, 0f
+        )
+
+        val big = Bitmap.createBitmap(enlarge, enlarge, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(big)
+        val paint = Paint().apply {
+            isFilterBitmap = true          // 雙線性，對齊 PIL 的 BILINEAR
+            isAntiAlias = true
+            colorFilter = ColorMatrixColorFilter(ColorMatrix(lum))
+        }
+        canvas.drawBitmap(bmp, null, Rect(0, 0, enlarge, enlarge), paint)
+
+        val cropped = Bitmap.createBitmap(big, offset, offset, targetWidth, targetHeight)
+        big.recycle()
+        return cropped
     }
 
     private fun saveBitmap(bmp: Bitmap, file: File) {
