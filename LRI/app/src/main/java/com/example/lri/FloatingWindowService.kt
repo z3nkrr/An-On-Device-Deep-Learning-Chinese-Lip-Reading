@@ -55,6 +55,15 @@ class FloatingWindowService : LifecycleService() {
     private val TARGET_FRAMES = 40
     private val TARGET_FPS = 25
 
+    // ---- 端到端延遲量測 ----
+    // 量測時務必設為 false：把 40 張 PNG 寫入外部儲存的時間並非管線的一部分
+    private val SAVE_DEBUG_FRAMES = false
+    private var tExtractNs = 0L      // 影格抽取
+    private var tDetectNs = 0L       // MediaPipe 唇部偵測
+    private var tCropNs = 0L         // 裁切 + 灰階 + 縮放
+    private var tRecognizeNs = 0L    // 模型推論 + 字典解碼
+    private var nFrames = 0
+
     private lateinit var videoOutputFile: File
 
     // ✅ 恢復真實模型宣告
@@ -288,6 +297,7 @@ class FloatingWindowService : LifecycleService() {
             if (rootDir.exists()) { rootDir.deleteRecursively() }
             rootDir.mkdirs()
             val startTime = System.currentTimeMillis()
+            tExtractNs = 0L; tDetectNs = 0L; tCropNs = 0L; tRecognizeNs = 0L; nFrames = 0
             val retriever = MediaMetadataRetriever()
             try {
                 retriever.setDataSource(videoFile.absolutePath)
@@ -310,14 +320,27 @@ class FloatingWindowService : LifecycleService() {
 
                     while (targetTimeUs <= endUs && currentWordFrames.size < TARGET_FRAMES) {
 
-                        val rawFrame = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                        val tExtract0 = System.nanoTime()
+                        var rawFrame = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
                             retriever.getScaledFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST, 360, 640)
                         } else {
                             retriever.getFrameAtTime(targetTimeUs, MediaMetadataRetriever.OPTION_CLOSEST)
                         }
+                        // MediaPipe 只接受 ARGB_8888。部分機型（例如 Xperia 10 III）的解碼器
+                        // 會回傳 RGB_565 或 HARDWARE，直接送進 BitmapImageBuilder 會拋
+                        // UnsupportedOperationException，導致每一格都退回黑畫面。
+                        if (rawFrame != null && rawFrame.config != Bitmap.Config.ARGB_8888) {
+                            val converted = rawFrame.copy(Bitmap.Config.ARGB_8888, false)
+                            rawFrame.recycle()
+                            rawFrame = converted
+                        }
+                        tExtractNs += System.nanoTime() - tExtract0
 
                         if (rawFrame != null) {
+                            nFrames++
+                            val tDetect0 = System.nanoTime()
                             val detectedRect = detectFaceAndGetRect(rawFrame)
+                            tDetectNs += System.nanoTime() - tDetect0
                             if (detectedRect != null) {
                                 lastKnownRect = detectedRect
                             }
@@ -333,6 +356,7 @@ class FloatingWindowService : LifecycleService() {
                                 if (left + width > rawFrame.width) width = rawFrame.width - left
                                 if (top + height > rawFrame.height) height = rawFrame.height - top
 
+                                val tCrop0 = System.nanoTime()
                                 val cropped = Bitmap.createBitmap(rawFrame, left, top, width, height)
                                 val resized = toGrayscaleAndResize(cropped, 88, 88)
 
@@ -340,6 +364,7 @@ class FloatingWindowService : LifecycleService() {
                                 if (cropped != rawFrame) {
                                     cropped.recycle()
                                 }
+                                tCropNs += System.nanoTime() - tCrop0
 
                                 resized
                             } else {
@@ -364,12 +389,14 @@ class FloatingWindowService : LifecycleService() {
                     }
 
                     if (currentWordFrames.isNotEmpty()) {
-                        val wordDir = File(rootDir, "word_${index + 1}")
-                        wordDir.mkdirs()
+                        if (SAVE_DEBUG_FRAMES) {
+                            val wordDir = File(rootDir, "word_${index + 1}")
+                            wordDir.mkdirs()
 
-                        for (i in currentWordFrames.indices) {
-                            val frameFile = File(wordDir, "frame_${String.format("%02d", i)}.png")
-                            saveBitmap(currentWordFrames[i], frameFile)
+                            for (i in currentWordFrames.indices) {
+                                val frameFile = File(wordDir, "frame_${String.format("%02d", i)}.png")
+                                saveBitmap(currentWordFrames[i], frameFile)
+                            }
                         }
 
                         allWordsBitmaps.add(currentWordFrames)
@@ -381,7 +408,12 @@ class FloatingWindowService : LifecycleService() {
 
             // 執行模型推論
             if (allWordsBitmaps.isNotEmpty()) {
+                val tRec0 = System.nanoTime()
                 val results = lipManager.recognizeSentence(allWordsBitmaps)
+                tRecognizeNs = System.nanoTime() - tRec0
+
+                logStageLatency(allWordsBitmaps.size, System.currentTimeMillis() - startTime)
+
                 withContext(Dispatchers.Main) {
                     updateUICallback?.invoke(results)
                 }
@@ -484,6 +516,31 @@ class FloatingWindowService : LifecycleService() {
         val cropped = Bitmap.createBitmap(big, offset, offset, targetWidth, targetHeight)
         big.recycle()
         return cropped
+    }
+
+    // 逐階段延遲統計。所有時間以毫秒輸出，並同時給出每個音節片段的平均值。
+    private fun logStageLatency(nSegments: Int, wallClockMs: Long) {
+        val ms = 1_000_000.0
+        val extract = tExtractNs / ms
+        val detect = tDetectNs / ms
+        val crop = tCropNs / ms
+        val recognize = tRecognizeNs / ms
+        val pipeline = extract + detect + crop + recognize
+        val per = if (nSegments > 0) nSegments.toDouble() else 1.0
+
+        Log.i("LRI_LATENCY", "=== 逐階段延遲 (音節片段 $nSegments 個, 影格 $nFrames 張) ===")
+        Log.i("LRI_LATENCY", "影格抽取        %8.1f ms  (%5.1f ms/音節, %5.2f ms/影格)"
+            .format(extract, extract / per, extract / maxOf(nFrames, 1)))
+        Log.i("LRI_LATENCY", "唇部偵測        %8.1f ms  (%5.1f ms/音節, %5.2f ms/影格)"
+            .format(detect, detect / per, detect / maxOf(nFrames, 1)))
+        Log.i("LRI_LATENCY", "裁切/灰階/縮放  %8.1f ms  (%5.1f ms/音節, %5.2f ms/影格)"
+            .format(crop, crop / per, crop / maxOf(nFrames, 1)))
+        Log.i("LRI_LATENCY", "推論+字典解碼   %8.1f ms  (%5.1f ms/音節)"
+            .format(recognize, recognize / per))
+        Log.i("LRI_LATENCY", "---------------------------------------------")
+        Log.i("LRI_LATENCY", "管線合計        %8.1f ms  (%5.1f ms/音節)".format(pipeline, pipeline / per))
+        Log.i("LRI_LATENCY", "錄影結束到結果  %8d ms".format(wallClockMs))
+        Log.i("LRI_LATENCY", "存圖除錯: %s".format(if (SAVE_DEBUG_FRAMES) "開啟(數據無效)" else "關閉"))
     }
 
     private fun saveBitmap(bmp: Bitmap, file: File) {

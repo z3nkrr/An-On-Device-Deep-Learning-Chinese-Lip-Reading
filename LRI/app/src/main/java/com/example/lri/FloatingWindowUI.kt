@@ -120,7 +120,7 @@ fun ExpandedView(
         CustomActionButton(
             onClick = onWordSplit,
             icon = Icons.Default.KeyboardArrowDown,
-            text = "Word\nSplitting",
+            text = "Next\nCharacter",
             textColor = themeColor,
             iconSize = iconSize
         )

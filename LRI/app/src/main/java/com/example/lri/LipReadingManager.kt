@@ -84,8 +84,15 @@ class LipReadingManager(private val context: Context) {
 
         val pinyinSequenceCandidates = ArrayList<List<String>>()
 
+        // ---- 逐階段延遲量測 ----
+        var tPackNs = 0L        // 張量打包
+        var tInferNs = 0L       // TFLite 推論
+        var tDecodeNs = 0L      // 字典解碼
+
         for ((index, frames) in wordBitmaps.withIndex()) {
+            val tPack0 = System.nanoTime()
             val inputBuffer = preprocessBitmaps(frames)
+            tPackNs += System.nanoTime() - tPack0
 
             if (inputBuffer != null) {
                 var topPinyins = listOf("unknown")
@@ -93,7 +100,9 @@ class LipReadingManager(private val context: Context) {
                 if (!isMockMode && tfliteInterpreter != null) {
                     try {
                         val outputArray = Array(1) { FloatArray(NUM_CLASSES) }
+                        val tInfer0 = System.nanoTime()
                         tfliteInterpreter?.run(inputBuffer, outputArray)
+                        tInferNs += System.nanoTime() - tInfer0
 
                         topPinyins = lipProcessor.getTopKPinyins(outputArray[0], 3)
                         lipProcessor.decodeAndLog(outputArray[0], index + 1)
@@ -106,8 +115,29 @@ class LipReadingManager(private val context: Context) {
                 }
             }
         }
-        if (pinyinSequenceCandidates.isEmpty()) return listOf("無法辨識拼音")
-        return smartConverter.convertToSentence(pinyinSequenceCandidates)
+
+        if (pinyinSequenceCandidates.isEmpty()) {
+            logRecognizeLatency(wordBitmaps.size, tPackNs, tInferNs, 0L)
+            return listOf("無法辨識拼音")
+        }
+
+        val tDecode0 = System.nanoTime()
+        val sentences = smartConverter.convertToSentence(pinyinSequenceCandidates)
+        tDecodeNs = System.nanoTime() - tDecode0
+
+        logRecognizeLatency(wordBitmaps.size, tPackNs, tInferNs, tDecodeNs)
+        return sentences
+    }
+
+    private fun logRecognizeLatency(nSegments: Int, packNs: Long, inferNs: Long, decodeNs: Long) {
+        val ms = 1_000_000.0
+        val per = if (nSegments > 0) nSegments.toDouble() else 1.0
+        val pack = packNs / ms
+        val infer = inferNs / ms
+        val decode = decodeNs / ms
+        Log.i("LRI_LATENCY", "張量打包        %8.1f ms  (%5.1f ms/音節)".format(pack, pack / per))
+        Log.i("LRI_LATENCY", "TFLite 推論     %8.1f ms  (%5.1f ms/音節)".format(infer, infer / per))
+        Log.i("LRI_LATENCY", "字典解碼        %8.1f ms  (整句一次)".format(decode))
     }
 
     private fun preprocessBitmaps(frames: List<Bitmap>): ByteBuffer? {

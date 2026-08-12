@@ -7,7 +7,7 @@
     <string name="step3_1">4. The frame turns red to indicate recording</string>
     <string name="step3_2">5. Tap Stop to end lip-reading input</string>
     <string name="step3_3">6. When moving on to the next</string>
-    <string name="step3_3_2">   character, tap Word Splitting once</string>
+    <string name="step3_3_2">   character, tap Next Character once</string>
     <string name="step4">7. Tap a candidate word to finish</string>
     <string name="FloatingWindowSwitch">Floating Window Toggle</string>
 </resources>

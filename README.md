@@ -18,12 +18,14 @@ configurations, and TFLite utilities for edge deployment, together with the
 Android application that performs inference, pinyin-dictionary decoding, and
 cross-application text injection entirely on the device.
 
-The model is trained and evaluated on the DMCLR dataset. On a held-out split of
-DMCLR it reaches **87.83%** word-level accuracy. On a Samsung Galaxy S25 the
-exported TFLite model requires approximately **180 ms of model inference per
-word segment**. This figure covers model inference only; it excludes camera
-capture, frame extraction, landmark detection, mouth cropping, dictionary
-decoding, and text injection.
+The model is trained and evaluated on the DMCLR dataset. On a held-out split it
+reaches **87.8%** syllable-level accuracy. On a Samsung Galaxy S25 the exported
+TFLite model requires about **180 ms of model inference per syllable segment**
+when measured on its own with the device idle, and about **319 ms** when called
+from within the running pipeline. Either figure covers model inference only; it
+excludes camera capture, frame extraction, landmark detection, mouth cropping,
+dictionary decoding, and text injection. End to end, a single utterance takes
+roughly **10 s** on the same device.
 
 ## Scope and Limitations
 
@@ -32,18 +34,17 @@ dictionary decoding, and cross-application text entry — can be integrated and
 executed within the resource budget of a consumer smartphone. It does **not**
 demonstrate a usable everyday input method.
 
-- The reported accuracy is measured on a held-out split of DMCLR, which was
-  recorded under controlled conditions. It does not transfer to live phone
-  capture.
-- In informal testing with the phone camera, recognition failed even for
-  utterances drawn from the training vocabulary. The gap between the dataset's
-  recording conditions and live capture is severe rather than marginal, and
-  closing it remains open work.
-- Word segmentation is semi-automatic: the user taps a button during recording
-  to mark word boundaries. The system is therefore not hands-free in its
+- The held-out split of DMCLR shares speakers with the training set, so the
+  87.8% figure is speaker-dependent and does not indicate performance for a
+  speaker the model has never seen.
+- In testing with live phone capture by a speaker outside the dataset,
+  syllable-level Top-1 accuracy was **2.9%** and no sentence was recognized
+  correctly.
+- Word segmentation is semi-automatic: the user taps a button once per
+  character while recording. The system is therefore not hands-free in its
   current form.
-- The latency figure above is model inference only and should not be read as
-  end-to-end response time.
+- Frame extraction and landmark detection account for about 87% of the
+  end-to-end latency; model inference is under 10%.
 
 We state these limitations explicitly so that this artifact is not mistaken for
 a deployable product.
