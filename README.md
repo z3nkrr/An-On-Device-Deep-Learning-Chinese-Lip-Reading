@@ -24,8 +24,8 @@ TFLite model requires about **180 ms of model inference per syllable segment**
 when measured on its own with the device idle, and about **319 ms** when called
 from within the running pipeline. Either figure covers model inference only; it
 excludes camera capture, frame extraction, landmark detection, mouth cropping,
-dictionary decoding, and text injection. End to end, a single utterance takes
-roughly **10 s** on the same device.
+dictionary decoding, and text injection. End to end, the pipeline takes about 3.6 s per syllable on the same device,
+and about 6.1 s per syllable on a Sony Xperia 10 III.
 
 ## Scope and Limitations
 
@@ -40,7 +40,7 @@ demonstrate a usable everyday input method.
 - In testing with live phone capture by a speaker outside the dataset,
   syllable-level Top-1 accuracy was **2.9%** and no sentence was recognized
   correctly.
-- Word segmentation is semi-automatic: the user taps a button once per
+- Segmenta is semi-automatic: the user taps a button once per
   character while recording. The system is therefore not hands-free in its
   current form.
 - Frame extraction and landmark detection account for about 87% of the
@@ -51,7 +51,7 @@ a deployable product.
 
 ## Usage
 
-1.Model training:
+1. Model training:
 
 ```
 python train.py --data "path/to/DMCLR_Dataset"
@@ -74,7 +74,7 @@ Outputs:
 - `checkpoints/best.pt`: State dictionary capturing the top validation accuracy.
 - `checkpoints/result.csv`: CSV log storing epoch number, training metrics, validation loss, validation accuracy, and learning rates
 
-2.Model Export & Deployment:
+2. Model Export & Deployment:
 Export PyTorch to ONNX:
 
 ```
